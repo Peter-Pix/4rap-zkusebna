@@ -1,9 +1,10 @@
+
 import React, { useState, useRef, useEffect } from 'react';
 import { BEATS } from '../constants';
-import { Beat, Recording, LyricSheet } from '../types';
+import { Beat, Recording, LyricSheet, MixSettings, MixerPreset } from '../types';
 import { Button } from '../components/Button';
 import { Modal } from '../components/Modal';
-import { Play, Square, Check, RefreshCw, Volume2, Music, Upload, Trash2, FileText, Sliders, X, Plus, ChevronDown, Repeat, Menu, Activity, Mic } from 'lucide-react';
+import { Play, Square, Check, RefreshCw, Volume2, Music, Upload, Trash2, FileText, Sliders, X, Plus, ChevronDown, Repeat, Menu, Activity, Mic, Settings, ChevronsRight, Save, LayoutTemplate } from 'lucide-react';
 
 interface StudioPageProps {
   onSaveRecording: (recording: Recording) => void;
@@ -20,7 +21,7 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
 };
 
 // Helper to create a simple reverb impulse response
-const createImpulseResponse = (audioContext: AudioContext, duration: number, decay: number) => {
+const createImpulseResponse = (audioContext: BaseAudioContext, duration: number, decay: number) => {
   const sampleRate = audioContext.sampleRate;
   const length = sampleRate * duration;
   const impulse = audioContext.createBuffer(2, length, sampleRate);
@@ -44,6 +45,81 @@ const countSyllables = (text: string): number => {
   return matches ? matches.length : 0;
 };
 
+// Helper: Simple Peak Detection for BPM
+const detectBPM = async (buffer: AudioBuffer): Promise<number> => {
+  try {
+    const data = buffer.getChannelData(0);
+    const sampleRate = buffer.sampleRate;
+    
+    // Low pass filter simulation (simple moving average) to focus on bass/kick
+    // This is very rudimentary.
+    
+    // We will look for peaks in 0.5s windows
+    const peaks = [];
+    const threshold = 0.8; 
+    const minDistance = 0.3 * sampleRate; // Assume at least 0.3s between beats (max 200 BPM)
+    
+    let lastPeakIndex = 0;
+
+    for (let i = 0; i < data.length; i++) {
+       if (Math.abs(data[i]) > threshold) {
+         if (i - lastPeakIndex > minDistance) {
+           peaks.push(i);
+           lastPeakIndex = i;
+         }
+       }
+    }
+
+    if (peaks.length < 2) return 0;
+
+    // Calculate intervals
+    const intervals = [];
+    for (let i = 0; i < peaks.length - 1; i++) {
+      intervals.push(peaks[i+1] - peaks[i]);
+    }
+
+    // Find most common interval
+    const counts: {[key: number]: number} = {};
+    intervals.forEach(int => {
+       // Group vaguely similar intervals
+       const key = Math.round(int / 1000) * 1000; 
+       counts[key] = (counts[key] || 0) + 1;
+    });
+
+    let maxCount = 0;
+    let bestInterval = 0;
+    for (const key in counts) {
+       if (counts[key] > maxCount) {
+         maxCount = counts[key];
+         bestInterval = parseInt(key);
+       }
+    }
+
+    if (bestInterval === 0) return 0;
+
+    const bpm = 60 / (bestInterval / sampleRate);
+    
+    // Clamp to reasonable range (60-180) - doubling or halving if needed
+    let finalBpm = Math.round(bpm);
+    while (finalBpm < 70) finalBpm *= 2;
+    while (finalBpm > 180) finalBpm /= 2;
+
+    return Math.round(finalBpm);
+  } catch (e) {
+    console.warn("BPM Detection failed", e);
+    return 0;
+  }
+};
+
+type LoopMode = 'full' | 4 | 8 | 16;
+
+const DEFAULT_PRESETS: MixerPreset[] = [
+  { id: 'def_clean', name: 'Clean Rap', settings: { bass: 0, treble: 2, reverb: 0.1, echo: 0, denoise: 0.5 }, isDefault: true },
+  { id: 'def_trap', name: 'Trap Echo', settings: { bass: 2, treble: 4, reverb: 0.2, echo: 0.3, denoise: 0.2 }, isDefault: true },
+  { id: 'def_radio', name: 'Radio Hit', settings: { bass: 1, treble: 5, reverb: 0.15, echo: 0.05, denoise: 0.8 }, isDefault: true },
+  { id: 'def_dark', name: 'Deep/Dark', settings: { bass: 5, treble: -2, reverb: 0.4, echo: 0.1, denoise: 0.1 }, isDefault: true },
+];
+
 export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
   // --- STATE ---
   const [beats, setBeats] = useState<Beat[]>(BEATS);
@@ -53,12 +129,21 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
   const [isRecording, setIsRecording] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isPreviewing, setIsPreviewing] = useState(false);
+  
+  // Loop State
   const [isLooping, setIsLooping] = useState(false);
+  const [loopMode, setLoopMode] = useState<LoopMode>('full');
+
   const [timer, setTimer] = useState(0);
   const [isSaving, setIsSaving] = useState(false);
   const [showMixer, setShowMixer] = useState(false);
   const [showTools, setShowTools] = useState(false);
   
+  // Input Settings
+  const [inputDevices, setInputDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
+  const [inputGain, setInputGain] = useState(1.0);
+
   // Volume State
   const [masterVolume, setMasterVolume] = useState(1.0);
   const [beatVolume, setBeatVolume] = useState(0.8);
@@ -72,6 +157,7 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
   const [recordedBlob, setRecordedBlob] = useState<Blob | null>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [permissionError, setPermissionError] = useState<string | null>(null);
+  const [recordedBuffer, setRecordedBuffer] = useState<AudioBuffer | null>(null);
 
   // Lyrics State
   const [showLyrics, setShowLyrics] = useState(false);
@@ -80,6 +166,11 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
   const [flowAdviceDismissed, setFlowAdviceDismissed] = useState(false);
   const [showFlowAdvice, setShowFlowAdvice] = useState(false);
   const [isRenaming, setIsRenaming] = useState(false);
+
+  // Preset State
+  const [presets, setPresets] = useState<MixerPreset[]>(DEFAULT_PRESETS);
+  const [isSavingPreset, setIsSavingPreset] = useState(false);
+  const [newPresetName, setNewPresetName] = useState('');
 
   // Modal State
   const [modalConfig, setModalConfig] = useState<{
@@ -97,10 +188,12 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
   });
 
   // Mixing State
-  const [mixSettings, setMixSettings] = useState({
+  const [mixSettings, setMixSettings] = useState<MixSettings>({
     bass: 0,   // dB
     treble: 0, // dB
-    reverb: 0  // 0 to 1 mix
+    reverb: 0,  // 0 to 1 mix
+    echo: 0, // 0 to 1 mix
+    denoise: 0 // 0 to 1 intensity (HighPass)
   });
 
   // --- REFS ---
@@ -109,6 +202,7 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
   const chunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<number | null>(null);
   const recordingAudioRef = useRef<HTMLAudioElement | null>(null);
+  const waveformCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   // Web Audio API Refs for Visualizer & Mixing & Metronome
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -117,6 +211,9 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
   const analyserBeatRef = useRef<AnalyserNode | null>(null);
   const analyserMicRef = useRef<AnalyserNode | null>(null);
   const animationFrameRef = useRef<number | null>(null);
+
+  // Input Refs
+  const inputGainNodeRef = useRef<GainNode | null>(null);
 
   // Metronome Refs
   const nextNoteTimeRef = useRef(0.0);
@@ -128,8 +225,12 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
   const bassNodeRef = useRef<BiquadFilterNode | null>(null);
   const trebleNodeRef = useRef<BiquadFilterNode | null>(null);
   const reverbNodeRef = useRef<ConvolverNode | null>(null);
+  const echoNodeRef = useRef<DelayNode | null>(null);
+  const echoFeedbackNodeRef = useRef<GainNode | null>(null);
+  const denoiseNodeRef = useRef<BiquadFilterNode | null>(null); // HighPass filter
   const dryGainNodeRef = useRef<GainNode | null>(null);
   const wetGainNodeRef = useRef<GainNode | null>(null);
+  const echoGainNodeRef = useRef<GainNode | null>(null);
 
   const getAudioContext = () => {
     if (!audioContextRef.current) {
@@ -138,9 +239,31 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
     return audioContextRef.current;
   };
 
-  // --- INIT LYRICS ---
+  // --- INIT SETTINGS ---
   useEffect(() => {
-    // Load lyrics from storage
+    // Enumerate devices
+    if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+      navigator.mediaDevices.enumerateDevices().then(devices => {
+        const inputs = devices.filter(d => d.kind === 'audioinput');
+        setInputDevices(inputs);
+        if (inputs.length > 0 && !selectedDeviceId) {
+          setSelectedDeviceId(inputs[0].deviceId);
+        }
+      });
+    }
+  }, []);
+
+  // Update Input Gain Logic (Pre-recording)
+  useEffect(() => {
+    if (inputGainNodeRef.current) {
+      inputGainNodeRef.current.gain.value = inputGain;
+    }
+  }, [inputGain]);
+
+
+  // --- INIT LYRICS & PRESETS ---
+  useEffect(() => {
+    // Load lyrics
     try {
       const storedLyrics = localStorage.getItem('zkusebna_lyrics_v1');
       if (storedLyrics) {
@@ -155,6 +278,15 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
         createInitialLyricSheet();
       }
 
+      // Load Presets
+      const storedPresets = localStorage.getItem('zkusebna_mixer_presets_v1');
+      if (storedPresets) {
+        const parsed = JSON.parse(storedPresets);
+        // Merge defaults with stored custom presets (filtering out defaults from stored to avoid dupes/stale defaults)
+        const customPresets = parsed.filter((p: MixerPreset) => !p.isDefault);
+        setPresets([...DEFAULT_PRESETS, ...customPresets]);
+      }
+
       // Check flow advice suppression
       const adviceTimestamp = localStorage.getItem('zkusebna_flow_advice_dismissed');
       if (adviceTimestamp) {
@@ -162,7 +294,7 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
         if (days < 7) setFlowAdviceDismissed(true);
       }
     } catch (e) {
-      console.error("Error loading lyrics", e);
+      console.error("Error loading data", e);
       createInitialLyricSheet();
     }
   }, []);
@@ -172,6 +304,15 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
       localStorage.setItem('zkusebna_lyrics_v1', JSON.stringify(lyricSheets));
     }
   }, [lyricSheets]);
+
+  // Save presets when they change
+  useEffect(() => {
+    if (presets.length > 0) {
+      // Only save custom presets to storage
+      const customPresets = presets.filter(p => !p.isDefault);
+      localStorage.setItem('zkusebna_mixer_presets_v1', JSON.stringify(customPresets));
+    }
+  }, [presets]);
 
   const createInitialLyricSheet = () => {
     const newSheet: LyricSheet = {
@@ -294,6 +435,31 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
     setModalConfig(prev => ({ ...prev, isOpen: false }));
   };
 
+  // --- PRESET HANDLERS ---
+  const handleSavePreset = () => {
+    if (!newPresetName.trim()) return;
+    const newPreset: MixerPreset = {
+      id: `custom-${Date.now()}`,
+      name: newPresetName.trim(),
+      settings: { ...mixSettings }, // Copy current settings
+      isDefault: false
+    };
+    setPresets(prev => [...prev, newPreset]);
+    setNewPresetName('');
+    setIsSavingPreset(false);
+  };
+
+  const handleLoadPreset = (preset: MixerPreset) => {
+    setMixSettings({ ...preset.settings });
+  };
+
+  const handleDeletePreset = (e: React.MouseEvent, id: string) => {
+    e.stopPropagation();
+    openConfirm("Smazat preset?", "Opravdu chceš smazat toto nastavení mixu?", () => {
+      setPresets(prev => prev.filter(p => p.id !== id));
+    });
+  };
+
   // --- METRONOME ENGINE ---
   const scheduleMetronomeClick = (time: number) => {
     const ctx = getAudioContext();
@@ -357,7 +523,7 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
   }, [metronomeOn, isPlaying, isRecording]);
 
 
-  // --- VISUALIZER SETUP ---
+  // --- VISUALIZER & LOOP ENGINE ---
   useEffect(() => {
     if (beatAudioRef.current && !beatSourceRef.current) {
       const ctx = getAudioContext();
@@ -384,6 +550,22 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
 
     const width = canvas.width;
     const height = canvas.height;
+
+    // --- LOOP LOGIC (Check every frame) ---
+    if (isLooping && loopMode !== 'full' && beatAudioRef.current && isPlaying) {
+       // Calculate Loop Duration
+       const bpm = selectedBeat?.bpm || 120;
+       const secondsPerBeat = 60 / bpm;
+       const bars = typeof loopMode === 'number' ? loopMode : 4;
+       // Assuming 4/4 time signature
+       const loopDuration = secondsPerBeat * 4 * bars;
+       
+       if (beatAudioRef.current.currentTime >= loopDuration) {
+          beatAudioRef.current.currentTime = 0;
+          // Note: HTML audio loop attribute isn't precise enough for bar looping,
+          // so we force seek. This might click slightly.
+       }
+    }
 
     // Background
     ctx.fillStyle = '#ffffff';
@@ -465,7 +647,59 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
         cancelAnimationFrame(animationFrameRef.current);
       }
     };
-  }, [isRecording, isPreviewing, selectedBeat]);
+  }, [isRecording, isPreviewing, selectedBeat, isLooping, loopMode]);
+
+  // --- STATIC WAVEFORM GENERATION (POST RECORDING) ---
+  useEffect(() => {
+    if (recordedBlob) {
+      const ctx = getAudioContext();
+      recordedBlob.arrayBuffer().then(arrayBuffer => {
+        ctx.decodeAudioData(arrayBuffer).then(buffer => {
+          setRecordedBuffer(buffer);
+        });
+      }).catch(e => console.error("Error decoding audio data", e));
+    } else {
+      setRecordedBuffer(null);
+    }
+  }, [recordedBlob]);
+
+  useEffect(() => {
+    if (recordedBuffer && waveformCanvasRef.current) {
+      const canvas = waveformCanvasRef.current;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      const width = canvas.width;
+      const height = canvas.height;
+      const data = recordedBuffer.getChannelData(0);
+      const step = Math.ceil(data.length / width);
+      const amp = height / 2;
+
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, width, height);
+      
+      // Draw Grid
+      ctx.strokeStyle = '#eeeeee';
+      ctx.beginPath();
+      ctx.moveTo(0, height/2);
+      ctx.lineTo(width, height/2);
+      ctx.stroke();
+
+      ctx.fillStyle = '#000000'; // Black Waveform
+      
+      for (let i = 0; i < width; i++) {
+        let min = 1.0;
+        let max = -1.0;
+        for (let j = 0; j < step; j++) {
+          const datum = data[(i * step) + j];
+          if (datum < min) min = datum;
+          if (datum > max) max = datum;
+        }
+        ctx.fillRect(i, (1 + min) * amp, 1, Math.max(1, (max - min) * amp));
+      }
+    }
+  }, [recordedBuffer]);
+
 
   // --- MIXING ENGINE (POST-RECORDING) ---
   useEffect(() => {
@@ -473,64 +707,104 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
     if (audioUrl && recordingAudioRef.current) {
       const ctx = getAudioContext();
       
-      // Cleanup previous nodes if any
-      if (recordingSourceRef.current) {
-         // Reusing structure
-      } else {
-        try {
-          const source = ctx.createMediaElementSource(recordingAudioRef.current);
-          recordingSourceRef.current = source;
+      // We always rebuild chain here for simplicity in this MVP when recording changes
+      // In a pro app, we'd maintain graph persistence better.
+      try {
+        const source = ctx.createMediaElementSource(recordingAudioRef.current);
+        recordingSourceRef.current = source;
 
-          // EQ Nodes
-          const bass = ctx.createBiquadFilter();
-          bass.type = 'lowshelf';
-          bass.frequency.value = 200;
-          bassNodeRef.current = bass;
+        // Denoise (HighPass)
+        const denoise = ctx.createBiquadFilter();
+        denoise.type = 'highpass';
+        denoise.frequency.value = 0; // Default off
+        denoiseNodeRef.current = denoise;
 
-          const treble = ctx.createBiquadFilter();
-          treble.type = 'highshelf';
-          treble.frequency.value = 2000;
-          trebleNodeRef.current = treble;
+        // EQ Nodes
+        const bass = ctx.createBiquadFilter();
+        bass.type = 'lowshelf';
+        bass.frequency.value = 200;
+        bassNodeRef.current = bass;
 
-          // Reverb Nodes
-          const reverb = ctx.createConvolver();
-          reverb.buffer = createImpulseResponse(ctx, 2, 2); // 2 seconds reverb
-          reverbNodeRef.current = reverb;
+        const treble = ctx.createBiquadFilter();
+        treble.type = 'highshelf';
+        treble.frequency.value = 2000;
+        trebleNodeRef.current = treble;
 
-          const dryGain = ctx.createGain();
-          dryGainNodeRef.current = dryGain;
+        // Reverb Nodes
+        const reverb = ctx.createConvolver();
+        reverb.buffer = createImpulseResponse(ctx, 2, 2); // 2 seconds reverb
+        reverbNodeRef.current = reverb;
 
-          const wetGain = ctx.createGain();
-          wetGainNodeRef.current = wetGain;
+        // Echo Nodes
+        const echo = ctx.createDelay();
+        echo.delayTime.value = 0.3; // 300ms delay
+        echoNodeRef.current = echo;
+        
+        const echoFeedback = ctx.createGain();
+        echoFeedback.gain.value = 0.3;
+        echoFeedbackNodeRef.current = echoFeedback;
 
-          // Chain: Source -> Bass -> Treble -> Split
-          source.connect(bass);
-          bass.connect(treble);
+        // Gains
+        const dryGain = ctx.createGain();
+        dryGainNodeRef.current = dryGain;
 
-          // Path 1: Dry
-          treble.connect(dryGain);
-          dryGain.connect(ctx.destination);
+        const wetGain = ctx.createGain(); // Reverb Gain
+        wetGainNodeRef.current = wetGain;
+        
+        const echoGain = ctx.createGain(); // Echo Gain
+        echoGainNodeRef.current = echoGain;
 
-          // Path 2: Wet (Reverb)
-          treble.connect(reverb);
-          reverb.connect(wetGain);
-          wetGain.connect(ctx.destination);
+        // --- CONNECT THE GRAPH ---
+        // Source -> Denoise -> Bass -> Treble -> (Splits)
+        source.connect(denoise);
+        denoise.connect(bass);
+        bass.connect(treble);
 
-        } catch (e) {
-          console.error("Error setting up mixing chain", e);
-        }
+        // Path 1: Dry
+        treble.connect(dryGain);
+        dryGain.connect(ctx.destination);
+
+        // Path 2: Reverb
+        treble.connect(reverb);
+        reverb.connect(wetGain);
+        wetGain.connect(ctx.destination);
+
+        // Path 3: Echo (Delay loop)
+        treble.connect(echo);
+        echo.connect(echoFeedback);
+        echoFeedback.connect(echo); // Loop
+        echo.connect(echoGain);
+        echoGain.connect(ctx.destination);
+
+      } catch (e) {
+        console.error("Error setting up mixing chain", e);
       }
     }
   }, [audioUrl]);
 
   // Update Mix Params
   useEffect(() => {
+    if (denoiseNodeRef.current) {
+       // Denoise simply cuts low end rumble. Scale 0-1 to 0-500Hz
+       denoiseNodeRef.current.frequency.value = mixSettings.denoise * 500;
+    }
     if (bassNodeRef.current) bassNodeRef.current.gain.value = mixSettings.bass;
     if (trebleNodeRef.current) trebleNodeRef.current.gain.value = mixSettings.treble;
-    if (dryGainNodeRef.current && wetGainNodeRef.current) {
-      dryGainNodeRef.current.gain.value = 1 - mixSettings.reverb;
+    
+    // Balance dry/wet slightly so volume doesn't explode
+    // Simplistic mixing logic for MVP
+    if (dryGainNodeRef.current) {
+       dryGainNodeRef.current.gain.value = 1.0; // Keep dry signal strong usually
+    }
+    
+    if (wetGainNodeRef.current) {
       wetGainNodeRef.current.gain.value = mixSettings.reverb * 1.5; 
     }
+    
+    if (echoGainNodeRef.current) {
+       echoGainNodeRef.current.gain.value = mixSettings.echo;
+    }
+
   }, [mixSettings]);
 
   // Volume Updates
@@ -574,14 +848,26 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
     return `${mins}:${secs.toString().padStart(2, '0')}`;
   };
 
-  const handleUploadBeat = (event: React.ChangeEvent<HTMLInputElement>) => {
+  const handleUploadBeat = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (file) {
       const url = URL.createObjectURL(file);
+      
+      // Attempt BPM Detection
+      let detectedBpm = 0;
+      try {
+         const ctx = getAudioContext();
+         const buffer = await file.arrayBuffer();
+         const audioBuffer = await ctx.decodeAudioData(buffer);
+         detectedBpm = await detectBPM(audioBuffer);
+      } catch (e) {
+         console.warn("BPM detection failed on upload", e);
+      }
+
       const newBeat: Beat = {
         id: `custom-${Date.now()}`,
         title: file.name.replace(/\.[^/.]+$/, "").substring(0, 20),
-        bpm: 0,
+        bpm: detectedBpm,
         genre: 'Custom',
         url: url,
         coverImage: 'https://images.unsplash.com/photo-1511379938547-c1f69419868d?q=80&w=200&auto=format&fit=crop&grayscale'
@@ -624,6 +910,20 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
     );
   };
 
+  const handleSelectBeat = (beat: Beat) => {
+     if (isRecording) return;
+     if (isPreviewing && beatAudioRef.current) {
+         beatAudioRef.current.pause();
+         beatAudioRef.current.currentTime = 0;
+         setIsPreviewing(false);
+     }
+     setSelectedBeat(beat);
+     // Auto-enable metronome if no URL (Metronome only beat)
+     if (!beat.url) {
+        setMetronomeOn(true);
+     }
+  };
+
   const startRecording = async () => {
     const ctx = getAudioContext();
     if (ctx.state === 'suspended') {
@@ -638,15 +938,39 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
 
     try {
       setPermissionError(null);
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      
+      const constraints = {
+        audio: {
+          deviceId: selectedDeviceId ? { exact: selectedDeviceId } : undefined,
+          echoCancellation: false,
+          autoGainControl: false, 
+          noiseSuppression: false 
+        }
+      };
+
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
       
       const micSource = ctx.createMediaStreamSource(stream);
+      
+      // INPUT GAIN NODE
+      const gainNode = ctx.createGain();
+      gainNode.gain.value = inputGain;
+      inputGainNodeRef.current = gainNode;
+      
+      // ANALYSER
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 2048;
-      micSource.connect(analyser);
       analyserMicRef.current = analyser;
 
-      mediaRecorderRef.current = new MediaRecorder(stream);
+      // RECORDING DESTINATION (This allows us to record the gained audio)
+      const destination = ctx.createMediaStreamDestination();
+      
+      // Graph: Mic -> Gain -> Analyser -> Destination
+      micSource.connect(gainNode);
+      gainNode.connect(analyser);
+      gainNode.connect(destination);
+
+      mediaRecorderRef.current = new MediaRecorder(destination.stream);
       chunksRef.current = [];
 
       mediaRecorderRef.current.ondataavailable = (e) => {
@@ -661,7 +985,9 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
         const url = URL.createObjectURL(blob);
         setAudioUrl(url);
         stream.getTracks().forEach(track => track.stop());
+        // Clean up nodes
         micSource.disconnect();
+        gainNode.disconnect();
         setShowMixer(true); // Auto show mixer on finish
       };
 
@@ -723,36 +1049,225 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
   };
 
   const togglePreview = async () => {
-    if (!beatAudioRef.current || !selectedBeat?.url) return;
+    // Allows preview/play even if URL is empty provided metronome is on (practice mode)
+    if (!beatAudioRef.current) return;
+    if (!selectedBeat?.url && !metronomeOn) return; 
+
     const ctx = getAudioContext();
     if (ctx.state === 'suspended') {
       await ctx.resume();
     }
 
     if (isPreviewing) {
-      beatAudioRef.current.pause();
-      beatAudioRef.current.currentTime = 0;
+      if (selectedBeat?.url) {
+         beatAudioRef.current.pause();
+         beatAudioRef.current.currentTime = 0;
+      }
       setIsPreviewing(false);
     } else {
-      beatAudioRef.current.currentTime = 0;
-      beatAudioRef.current.volume = Math.min(Math.max(beatVolume * masterVolume, 0), 1);
-      beatAudioRef.current.play();
+      if (selectedBeat?.url) {
+         beatAudioRef.current.currentTime = 0;
+         beatAudioRef.current.volume = Math.min(Math.max(beatVolume * masterVolume, 0), 1);
+         beatAudioRef.current.play();
+      }
       setIsPreviewing(true);
     }
   };
+
+  // --- MIXDOWN RENDERING ---
+  const renderMixdown = async (vocalBuffer: AudioBuffer, beatUrl: string): Promise<Blob | null> => {
+      try {
+        const offlineCtx = new OfflineAudioContext(2, vocalBuffer.length, vocalBuffer.sampleRate);
+        
+        // 1. Prepare Vocal Track with Effects
+        const vocalSource = offlineCtx.createBufferSource();
+        vocalSource.buffer = vocalBuffer;
+
+        // Recreate effects chain in offline context
+        const denoise = offlineCtx.createBiquadFilter();
+        denoise.type = 'highpass';
+        denoise.frequency.value = mixSettings.denoise * 500;
+
+        const bass = offlineCtx.createBiquadFilter();
+        bass.type = 'lowshelf';
+        bass.frequency.value = 200;
+        bass.gain.value = mixSettings.bass;
+
+        const treble = offlineCtx.createBiquadFilter();
+        treble.type = 'highshelf';
+        treble.frequency.value = 2000;
+        treble.gain.value = mixSettings.treble;
+
+        // Effect Routing (Simplified for Mixdown - Parallel paths hard to manage without full graph, using direct chain + sends)
+        // Note: For pure accuracy we should replicate exact graph. Here we'll do linear + reverb mix.
+        
+        const dryGain = offlineCtx.createGain();
+        dryGain.gain.value = recordingVolume; // Base volume
+
+        // Reverb Send
+        const reverb = offlineCtx.createConvolver();
+        reverb.buffer = createImpulseResponse(offlineCtx, 2, 2);
+        const reverbGain = offlineCtx.createGain();
+        reverbGain.gain.value = mixSettings.reverb * 1.5;
+
+        // Echo Send
+        const echo = offlineCtx.createDelay();
+        echo.delayTime.value = 0.3;
+        const echoFb = offlineCtx.createGain();
+        echoFb.gain.value = 0.3;
+        const echoGain = offlineCtx.createGain();
+        echoGain.gain.value = mixSettings.echo;
+
+        // Graph Wiring
+        vocalSource.connect(denoise);
+        denoise.connect(bass);
+        bass.connect(treble);
+        
+        // Dry Path
+        treble.connect(dryGain);
+        dryGain.connect(offlineCtx.destination);
+        
+        // Wet Paths
+        treble.connect(reverb);
+        reverb.connect(reverbGain);
+        reverbGain.connect(offlineCtx.destination);
+
+        treble.connect(echo);
+        echo.connect(echoFb);
+        echoFb.connect(echo);
+        echo.connect(echoGain);
+        echoGain.connect(offlineCtx.destination);
+
+        vocalSource.start(0);
+
+        // 2. Prepare Beat Track (if exists)
+        if (beatUrl) {
+            try {
+                const response = await fetch(beatUrl);
+                const arrayBuffer = await response.arrayBuffer();
+                const beatBuffer = await offlineCtx.decodeAudioData(arrayBuffer);
+                
+                const beatSource = offlineCtx.createBufferSource();
+                beatSource.buffer = beatBuffer;
+                
+                // LOOPING LOGIC FOR MIXDOWN
+                if (isLooping) {
+                  beatSource.loop = true;
+                  if (loopMode !== 'full') {
+                     // Calculate loop duration in seconds
+                     const bpm = selectedBeat?.bpm || 120;
+                     const loopSeconds = (60 / bpm) * 4 * loopMode;
+                     beatSource.loopEnd = loopSeconds;
+                  }
+                }
+
+                const beatGain = offlineCtx.createGain();
+                beatGain.gain.value = beatVolume;
+                
+                beatSource.connect(beatGain);
+                beatGain.connect(offlineCtx.destination);
+                beatSource.start(0);
+            } catch (e) {
+                console.warn("Could not mix beat into final export", e);
+            }
+        }
+
+        const renderedBuffer = await offlineCtx.startRendering();
+        
+        // Convert to WAV/WebM blob - Simplest for browser is usually just encoding buffer to WAV
+        // For this MVP, we will stick to a basic WAV encoder helper or just resolve logic.
+        // Since writing a WAV encoder is verbose, and `audio/webm` recording is what we usually have,
+        // we can't easily turn an AudioBuffer back to WebM without a library.
+        // However, we can trick it by playing it into a MediaRecorder or using a WAV encoder.
+        
+        // SIMPLE WAV ENCODER implementation for mixdown
+        return bufferToWav(renderedBuffer);
+
+      } catch (e) {
+          console.error("Mixdown failed", e);
+          return null;
+      }
+  };
+
+  // Basic WAV Encoder
+  const bufferToWav = (buffer: AudioBuffer): Blob => {
+     const numOfChan = buffer.numberOfChannels;
+     const length = buffer.length * numOfChan * 2 + 44;
+     const bufferArr = new ArrayBuffer(length);
+     const view = new DataView(bufferArr);
+     const channels = [];
+     let i;
+     let sample;
+     let offset = 0;
+     let pos = 0;
+   
+     // write WAVE header
+     setUint32(0x46464952);                         // "RIFF"
+     setUint32(length - 8);                         // file length - 8
+     setUint32(0x45564157);                         // "WAVE"
+   
+     setUint32(0x20746d66);                         // "fmt " chunk
+     setUint32(16);                                 // length = 16
+     setUint16(1);                                  // PCM (uncompressed)
+     setUint16(numOfChan);
+     setUint32(buffer.sampleRate);
+     setUint32(buffer.sampleRate * 2 * numOfChan);  // avg. bytes/sec
+     setUint16(numOfChan * 2);                      // block-align
+     setUint16(16);                                 // 16-bit (hardcoded in this example)
+   
+     setUint32(0x61746164);                         // "data" - chunk
+     setUint32(length - pos - 4);                   // chunk length
+   
+     // write interleaved data
+     for(i = 0; i < buffer.numberOfChannels; i++)
+       channels.push(buffer.getChannelData(i));
+   
+     while(pos < buffer.length) {
+       for(i = 0; i < numOfChan; i++) {             // interleave channels
+         sample = Math.max(-1, Math.min(1, channels[i][pos])); // clamp
+         sample = (0.5 + sample < 0 ? sample * 32768 : sample * 32767)|0; // scale to 16-bit signed int
+         view.setInt16(44 + offset, sample, true);          // write 16-bit sample
+         offset += 2;
+       }
+       pos++;
+     }
+   
+     return new Blob([bufferArr], { type: 'audio/wav' });
+   
+     function setUint16(data: any) {
+       view.setUint16(pos, data, true);
+       pos += 2;
+     }
+   
+     function setUint32(data: any) {
+       view.setUint32(pos, data, true);
+       pos += 4;
+     }
+  }
+
 
   const handleSave = async () => {
     if (!selectedBeat || !audioUrl || !recordedBlob) return;
     
     setIsSaving(true);
     try {
-      const base64Audio = await blobToBase64(recordedBlob);
+      // MIXDOWN PROCESS
+      let finalBlob = recordedBlob;
+      if (recordedBuffer) {
+         // Attempt mixdown
+         const mixedBlob = await renderMixdown(recordedBuffer, selectedBeat.url);
+         if (mixedBlob) {
+             finalBlob = mixedBlob;
+         }
+      }
+
+      const base64Audio = await blobToBase64(finalBlob);
 
       const newRecording: Recording = {
         id: Date.now().toString(),
         beatId: selectedBeat.id,
         beatTitle: selectedBeat.title,
-        name: `Track ${new Date().toLocaleTimeString()}`,
+        name: `Track ${new Date().toLocaleTimeString()} (Mix)`,
         date: new Date().toLocaleDateString(),
         blobUrl: base64Audio,
         duration: timer
@@ -762,26 +1277,16 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
       setRecordedBlob(null);
       setAudioUrl(null);
       setTimer(0);
-      setMixSettings({ bass: 0, treble: 0, reverb: 0 }); 
+      setMixSettings({ bass: 0, treble: 0, reverb: 0, echo: 0, denoise: 0 }); 
       setRecordingVolume(1);
       setShowMixer(false);
-      openAlert("Uloženo!", "Tvůj track byl úspěšně uložen do profilu.");
+      openAlert("Uloženo!", "Tvůj track (včetně mixu) byl úspěšně uložen do profilu.");
     } catch (error) {
       console.error("Error saving recording", error);
       openAlert("Chyba", "Chyba při ukládání nahrávky.");
     } finally {
       setIsSaving(false);
     }
-  };
-
-  const handleSelectBeat = (beat: Beat) => {
-     if (isRecording) return;
-     if (isPreviewing && beatAudioRef.current) {
-         beatAudioRef.current.pause();
-         beatAudioRef.current.currentTime = 0;
-         setIsPreviewing(false);
-     }
-     setSelectedBeat(beat);
   };
 
   return (
@@ -809,10 +1314,47 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
 
             <div className="flex-grow overflow-y-auto p-4 space-y-8">
                
+               {/* INPUT SETTINGS */}
+               <div className="border-3 border-black p-4 bg-gray-50 shadow-hard-sm">
+                  <h4 className="font-bold uppercase flex items-center gap-2 mb-4 text-sm"><Settings size={16}/> Nastavení Vstupu</h4>
+                  
+                  <div className="space-y-4">
+                      <div>
+                        <label className="text-xs font-bold uppercase block mb-1">Mikrofon</label>
+                        <select 
+                           value={selectedDeviceId} 
+                           onChange={(e) => setSelectedDeviceId(e.target.value)}
+                           className="w-full text-xs font-bold border-2 border-black p-2 bg-white"
+                        >
+                           {inputDevices.length === 0 && <option value="">Výchozí mikrofon</option>}
+                           {inputDevices.map(device => (
+                              <option key={device.deviceId} value={device.deviceId}>
+                                 {device.label || `Mikrofon ${device.deviceId.slice(0,5)}...`}
+                              </option>
+                           ))}
+                        </select>
+                      </div>
+                      
+                      <div>
+                         <label className="text-xs font-bold uppercase block mb-1 flex justify-between">
+                            <span>Input Gain</span>
+                            <span>{Math.round(inputGain * 100)}%</span>
+                         </label>
+                         <input 
+                            type="range" min="0" max="2" step="0.1" 
+                            value={inputGain} 
+                            onChange={(e) => setInputGain(parseFloat(e.target.value))}
+                            className="w-full h-2 bg-gray-300 accent-black"
+                         />
+                      </div>
+                  </div>
+               </div>
+
+
                {/* Metronome Section */}
                <div className="border-3 border-black p-4 bg-gray-50 shadow-hard-sm">
                   <div className="flex justify-between items-center mb-4">
-                     <h4 className="font-bold uppercase flex items-center gap-2"><Activity size={18}/> Metronom</h4>
+                     <h4 className="font-bold uppercase flex items-center gap-2 text-sm"><Activity size={16}/> Metronom</h4>
                      <button 
                         onClick={() => setMetronomeOn(!metronomeOn)}
                         className={`w-12 h-6 rounded-full border-2 border-black flex items-center transition-all ${metronomeOn ? 'bg-green-400 justify-end' : 'bg-gray-300 justify-start'}`}
@@ -834,27 +1376,51 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
                   </div>
                </div>
 
-               {/* Loop Toggle */}
-               <button
-                  onClick={() => setIsLooping(!isLooping)}
-                  className={`w-full flex items-center justify-between p-3 border-3 border-black font-bold uppercase transition-all shadow-hard-sm ${isLooping ? 'bg-brand-cyan' : 'bg-white hover:bg-gray-100'}`}
-                >
-                  <span className="flex items-center gap-2"><Repeat size={18} /> Loop Beat</span>
-                  <div className={`w-4 h-4 border-2 border-black ${isLooping ? 'bg-black' : 'bg-white'}`}></div>
-               </button>
+               {/* Loop Toggle & Options */}
+               <div className="border-3 border-black p-4 bg-gray-50 shadow-hard-sm">
+                 <button
+                    onClick={() => setIsLooping(!isLooping)}
+                    className={`w-full flex items-center justify-between font-bold uppercase transition-all mb-4`}
+                  >
+                    <span className="flex items-center gap-2 text-sm"><Repeat size={16} /> Loop Beat</span>
+                    <div className={`w-10 h-5 rounded-full border-2 border-black flex items-center px-1 ${isLooping ? 'bg-brand-cyan justify-end' : 'bg-white justify-start'}`}>
+                        <div className="w-3 h-3 bg-black rounded-full"></div>
+                    </div>
+                 </button>
+                 
+                 {isLooping && (
+                    <div className="grid grid-cols-2 gap-2">
+                       {[4, 8, 16].map((bars) => (
+                          <button 
+                            key={bars}
+                            onClick={() => setLoopMode(bars as LoopMode)}
+                            className={`p-2 text-xs font-black border-2 border-black uppercase transition-all ${loopMode === bars ? 'bg-black text-white' : 'bg-white text-black hover:bg-gray-200'}`}
+                          >
+                             {bars} Bars
+                          </button>
+                       ))}
+                       <button 
+                          onClick={() => setLoopMode('full')}
+                          className={`p-2 text-xs font-black border-2 border-black uppercase transition-all ${loopMode === 'full' ? 'bg-black text-white' : 'bg-white text-black hover:bg-gray-200'}`}
+                       >
+                          Full Song
+                       </button>
+                    </div>
+                 )}
+               </div>
 
                {/* Lyrics Toggle */}
                <button 
                   onClick={() => { setShowLyrics(!showLyrics); setShowTools(false); }}
                   className="w-full flex items-center justify-between p-3 border-3 border-black font-bold uppercase bg-brand-yellow shadow-hard-sm hover:translate-x-1"
                >
-                  <span className="flex items-center gap-2"><FileText size={18} /> Textař</span>
-                  <span>{showLyrics ? 'ZAVŘÍT' : 'OTEVŘÍT'}</span>
+                  <span className="flex items-center gap-2 text-sm"><FileText size={16} /> Textař</span>
+                  <span className="text-xs">{showLyrics ? 'ZAVŘÍT' : 'OTEVŘÍT'}</span>
                </button>
 
                {/* Beat Library */}
                <div>
-                  <h4 className="font-black uppercase mb-2 border-b-2 border-black pb-1">Knihovna Beatů</h4>
+                  <h4 className="font-black uppercase mb-2 border-b-2 border-black pb-1 text-sm">Knihovna Beatů</h4>
                   <label className="cursor-pointer block w-full bg-black text-white p-3 text-center font-bold uppercase hover:bg-gray-800 border-2 border-transparent transition-all shadow-hard-sm text-sm mb-4">
                      <span className="flex items-center justify-center gap-2"><Upload size={16} /> Nahrát vlastní</span>
                      <input type="file" accept="audio/*" onChange={handleUploadBeat} className="hidden" />
@@ -916,7 +1482,7 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
                       {getActiveSheet()?.title || 'Vybrat text'} <ChevronDown size={14} />
                     </button>
                     <button onClick={() => setIsRenaming(true)} className="ml-2 p-1 hover:bg-gray-200" title="Přejmenovat">
-                       <Sliders size={14} className="transform rotate-90" /> {/* Using slider icon as pencil approx or use a proper pencil icon if available in scope */}
+                       <Sliders size={14} className="transform rotate-90" /> {/* Using slider icon as pencil approx */}
                     </button>
                     {/* Dropdown content */}
                     <div className="absolute top-full left-0 w-48 bg-white border-2 border-black shadow-hard hidden group-hover:block z-50">
@@ -980,10 +1546,12 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
                {/* Audio Element (Hidden mostly) */}
                <audio 
                   ref={beatAudioRef} 
-                  src={selectedBeat?.url} 
-                  loop={isLooping} 
+                  src={selectedBeat?.url || ''} 
+                  loop={isLooping && loopMode === 'full'} 
                   crossOrigin="anonymous"
                   onEnded={() => {
+                     // Only stop if not looping full song. 
+                     // If looping segments, drawVisualizer handles the loop.
                      if(!isLooping) {
                         if(isRecording) stopRecording();
                         setIsPlaying(false);
@@ -999,14 +1567,32 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
 
          {/* VISUALIZER HERO */}
          <div className="relative flex-grow bg-white flex flex-col justify-center items-center overflow-hidden">
+            {/* Main real-time canvas */}
             <canvas 
                ref={canvasRef} 
                width={1200} 
                height={400} 
-               className="w-full h-full object-cover absolute inset-0 z-0"
+               className={`w-full h-full object-cover absolute inset-0 z-0 ${audioUrl ? 'opacity-20' : 'opacity-100'}`}
             />
             
-            {/* Overlay Info */}
+            {/* POST-RECORDING STATIC WAVEFORM */}
+            {audioUrl && (
+              <div className="absolute inset-0 z-10 flex items-center justify-center p-4">
+                 <div className="w-full max-w-4xl h-32 md:h-48 border-4 border-black bg-white shadow-hard relative">
+                    <canvas 
+                      ref={waveformCanvasRef}
+                      width={1000}
+                      height={200}
+                      className="w-full h-full"
+                    />
+                    <div className="absolute top-0 left-0 bg-brand-cyan text-black font-black text-xs px-2 border-r-2 border-b-2 border-black">
+                      NAHRÁVKA
+                    </div>
+                 </div>
+              </div>
+            )}
+            
+            {/* Overlay Info (Pre-recording) */}
             <div className="relative z-10 text-center pointer-events-none">
                {!isRecording && !audioUrl && (
                   <div className="bg-white border-4 border-black p-4 shadow-hard inline-block transform -rotate-2">
@@ -1018,7 +1604,7 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
          </div>
 
          {/* TRANSPORT CONTROLS BAR */}
-         <div className="border-t-4 border-black bg-white p-4 md:p-6">
+         <div className="border-t-4 border-black bg-white p-4 md:p-6 relative z-20">
             
             <div className="flex flex-col items-center">
                {/* Timer */}
@@ -1033,8 +1619,8 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
                      <>
                         <button 
                            onClick={togglePreview}
-                           disabled={!selectedBeat?.url}
-                           className={`w-16 h-16 border-4 border-black shadow-hard flex items-center justify-center transition-all ${!selectedBeat?.url ? 'opacity-50 cursor-not-allowed bg-gray-200' : isPreviewing ? 'bg-brand-cyan translate-y-1 shadow-none' : 'bg-white hover:bg-gray-100'}`}
+                           disabled={!selectedBeat?.url && !metronomeOn}
+                           className={`w-16 h-16 border-4 border-black shadow-hard flex items-center justify-center transition-all ${(!selectedBeat?.url && !metronomeOn) ? 'opacity-50 cursor-not-allowed bg-gray-200' : isPreviewing ? 'bg-brand-cyan translate-y-1 shadow-none' : 'bg-white hover:bg-gray-100'}`}
                            title="Preview Beat"
                         >
                            {isPreviewing ? <Square fill="black"/> : <Play fill="black"/>}
@@ -1052,17 +1638,17 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
                         </button>
 
                         <div className="w-16 h-16 flex items-center justify-center">
-                           {/* Spacer or Settings placeholder */}
                            <Activity className={metronomeOn ? "text-green-500 animate-pulse" : "text-gray-300"} />
                         </div>
                      </>
                   ) : (
-                     /* POST-RECORDING CONTROLS - SQUARE ICONS */
+                     /* POST-RECORDING CONTROLS */
                      <div className="flex items-center gap-6 w-full justify-center">
                         <button 
                            onClick={() => {
                               setAudioUrl(null);
                               setRecordedBlob(null);
+                              setRecordedBuffer(null);
                               setTimer(0);
                               setIsPlaying(false);
                               setShowMixer(false);
@@ -1083,7 +1669,7 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
 
                         <button 
                            onClick={handleSave}
-                           title="Uložit"
+                           title="Uložit a Mixovat"
                            className="w-20 h-20 bg-black text-white border-4 border-black hover:bg-gray-900 shadow-hard flex items-center justify-center transition-all active:translate-y-1 active:shadow-none"
                         >
                            {isSaving ? <RefreshCw className="animate-spin" size={32}/> : <Check size={36} strokeWidth={3}/>}
@@ -1106,6 +1692,52 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
          {/* COLLAPSIBLE MIXER PANEL */}
          {audioUrl && showMixer && (
              <div className="bg-gray-100 border-t-4 border-black p-6 animate-in slide-in-from-bottom-10 fade-in">
+                
+                {/* PRESETS TOOLBAR */}
+                <div className="max-w-4xl mx-auto mb-6 pb-6 border-b-2 border-gray-300">
+                    <div className="flex items-center justify-between mb-4">
+                        <h4 className="font-black uppercase text-sm flex items-center gap-2"><LayoutTemplate size={16}/> Presets</h4>
+                        {!isSavingPreset ? (
+                           <button onClick={() => setIsSavingPreset(true)} className="bg-black text-white px-3 py-1 text-xs font-bold uppercase flex items-center gap-2 hover:bg-gray-800 transition-colors">
+                             <Save size={14}/> Uložit aktuální
+                           </button>
+                        ) : (
+                           <div className="flex gap-2">
+                              <input 
+                                autoFocus
+                                value={newPresetName} 
+                                onChange={(e) => setNewPresetName(e.target.value)}
+                                placeholder="Název presetu..."
+                                className="border-2 border-black p-1 text-xs font-bold uppercase w-32 md:w-48"
+                              />
+                              <button onClick={handleSavePreset} className="bg-brand-cyan border-2 border-black px-2 hover:bg-cyan-400"><Check size={14}/></button>
+                              <button onClick={() => setIsSavingPreset(false)} className="bg-white border-2 border-black px-2 hover:bg-red-100 text-red-600"><X size={14}/></button>
+                           </div>
+                        )}
+                    </div>
+                    
+                    <div className="flex gap-3 overflow-x-auto pb-2 custom-scrollbar">
+                       {presets.map(preset => (
+                          <div key={preset.id} className="flex-shrink-0 group relative">
+                             <button 
+                                onClick={() => handleLoadPreset(preset)}
+                                className="px-4 py-2 bg-white border-2 border-black shadow-hard-sm text-xs font-bold uppercase hover:bg-brand-yellow hover:-translate-y-1 transition-all whitespace-nowrap"
+                             >
+                                {preset.name}
+                             </button>
+                             {!preset.isDefault && (
+                                <button 
+                                  onClick={(e) => handleDeletePreset(e, preset.id)}
+                                  className="absolute -top-2 -right-2 bg-red-500 text-white p-1 border-2 border-black rounded-full opacity-0 group-hover:opacity-100 transition-opacity transform scale-75 hover:scale-100"
+                                >
+                                   <Trash2 size={10} />
+                                </button>
+                             )}
+                          </div>
+                       ))}
+                    </div>
+                </div>
+
                 <div className="max-w-4xl mx-auto grid grid-cols-2 md:grid-cols-4 gap-8">
                   {/* Master Volume */}
                   <div className="text-center col-span-2 md:col-span-4 border-b-2 border-gray-300 pb-4 mb-2">
@@ -1130,10 +1762,20 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
                         <input type="range" min="-10" max="10" step="1" title="Treble" value={mixSettings.treble} onChange={(e) => setMixSettings({...mixSettings, treble: parseFloat(e.target.value)})} className="w-full accent-gray-400"/>
                      </div>
                   </div>
+                  
                   <div className="text-center">
-                     <label className="block text-xs font-bold uppercase mb-2 text-purple-600">Reverb</label>
-                     <input type="range" min="0" max="0.8" step="0.05" value={mixSettings.reverb} onChange={(e) => setMixSettings({...mixSettings, reverb: parseFloat(e.target.value)})} className="w-full accent-purple-600"/>
+                     <label className="block text-xs font-bold uppercase mb-2 text-purple-600">Reverb / Echo</label>
+                     <div className="flex gap-2">
+                        <input type="range" min="0" max="0.8" step="0.05" title="Reverb" value={mixSettings.reverb} onChange={(e) => setMixSettings({...mixSettings, reverb: parseFloat(e.target.value)})} className="w-full accent-purple-600"/>
+                        <input type="range" min="0" max="0.8" step="0.05" title="Echo" value={mixSettings.echo} onChange={(e) => setMixSettings({...mixSettings, echo: parseFloat(e.target.value)})} className="w-full accent-blue-600"/>
+                     </div>
                   </div>
+
+                  <div className="text-center">
+                     <label className="block text-xs font-bold uppercase mb-2 text-green-600">Denoise (Low Cut)</label>
+                     <input type="range" min="0" max="1" step="0.1" value={mixSettings.denoise} onChange={(e) => setMixSettings({...mixSettings, denoise: parseFloat(e.target.value)})} className="w-full accent-green-600"/>
+                  </div>
+
                 </div>
                 
                 {/* Invisible audio element for recording playback */}
@@ -1159,7 +1801,7 @@ export const StudioPage: React.FC<StudioPageProps> = ({ onSaveRecording }) => {
       )}
       
       <div className="mt-4 text-center font-bold text-xs text-gray-400 uppercase tracking-[0.2em]">
-         Zkušebna Studio v1.0
+         Zkušebna Studio v1.1
       </div>
 
     </div>

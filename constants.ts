@@ -5,6 +5,14 @@ const DEMO_BEAT_URL = "https://cdn.pixabay.com/download/audio/2022/03/15/audio_c
 
 export const BEATS: Beat[] = [
   {
+    id: 'metronome',
+    title: 'Jen Metronom',
+    bpm: 120,
+    genre: 'Nástroj',
+    url: '', // Empty URL indicates no backing track
+    coverImage: 'https://images.unsplash.com/photo-1519892300165-cb5542fb47c7?q=80&w=200&auto=format&fit=crop'
+  },
+  {
     id: '3',
     title: 'Sídliště Sen',
     bpm: 120,

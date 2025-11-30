@@ -1,6 +1,6 @@
 {
-  "name": "Zkušebna.cz MVP",
-  "description": "První verze online nahrávacího studia pro rappery a producenty.",
+  "name": "Zkušebn4RAP_MVP",
+  "description": "Vylepšená první verze online nahrávacího studia pro rappery a producenty.",
   "requestFramePermissions": [
     "microphone"
   ]

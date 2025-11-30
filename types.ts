@@ -1,3 +1,4 @@
+
 export interface Beat {
   id: string;
   title: string;
@@ -30,6 +31,21 @@ export interface Artist {
   bio: string;
   image: string;
   tags: string[];
+}
+
+export interface MixSettings {
+  bass: number;
+  treble: number;
+  reverb: number;
+  echo: number;
+  denoise: number;
+}
+
+export interface MixerPreset {
+  id: string;
+  name: string;
+  settings: MixSettings;
+  isDefault?: boolean;
 }
 
 export enum AppRoute {
