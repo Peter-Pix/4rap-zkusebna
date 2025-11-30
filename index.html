@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="cs">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=0" />
+    <title>Zkušebna.cz</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {
+              brand: {
+                bg: '#ffffff',
+                text: '#000000',
+                border: '#000000',
+                cyan: '#06b6d4',   // From image header
+                yellow: '#fbbf24', // From image tag
+                purple: '#e879f9', // From image tag
+                pink: '#e91e63',   // Existing accent
+                light: '#f3f4f6',  // Light gray for subtle backgrounds
+              }
+            },
+            boxShadow: {
+              'hard': '5px 5px 0px 0px #000000',
+              'hard-sm': '3px 3px 0px 0px #000000',
+              'hard-hover': '2px 2px 0px 0px #000000',
+            },
+            fontFamily: {
+              sans: ['Segoe UI', 'Helvetica Neue', 'Arial', 'sans-serif'],
+              display: ['Arial Black', 'Segoe UI', 'sans-serif'],
+            },
+            borderWidth: {
+              '3': '3px',
+              '4': '4px',
+            }
+          }
+        }
+      }
+    </script>
+    <style>
+      body {
+        background-color: #ffffff;
+        color: #000000;
+        font-family: 'Segoe UI', sans-serif;
+      }
+      /* Custom scrollbar */
+      ::-webkit-scrollbar {
+        width: 12px;
+      }
+      ::-webkit-scrollbar-track {
+        background: #ffffff; 
+        border-left: 3px solid black;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: #000000; 
+        border: 2px solid white;
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background: #e91e63; 
+      }
+      
+      .text-outline {
+        text-shadow: 2px 2px 0px #000;
+      }
+    </style>
+  <script type="importmap">
+{
+  "imports": {
+    "react/": "https://aistudiocdn.com/react@^19.2.0/",
+    "react": "https://aistudiocdn.com/react@^19.2.0",
+    "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.0/",
+    "lucide-react": "https://aistudiocdn.com/lucide-react@^0.555.0"
+  }
+}
+</script>
+<link rel="stylesheet" href="/index.css">
+</head>
+  <body>
+    <div id="root"></div>
+  <script type="module" src="/index.tsx"></script>
+</body>
+</html>
